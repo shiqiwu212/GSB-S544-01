@@ -1,0 +1,559 @@
+---
+title: "Lab 4 — Data is Delicious"
+author: "Shiqi Wu"
+format:
+  html:
+    self-contained: true
+    toc: true
+    number-sections: true
+jupyter: python3
+execute:
+  warning: false
+  echo: true
+  cache: false
+---
+
+**Lab 4 HTML (self-contained):** [D](https://github.com/%3CYOUR_USER%3E/%3CREPO%3E/blob/%3CCOMMIT_OR_BRANCH%3E/labs/lab04/lab4_data_is_delicious.html)[ata is Delicious — Week 202](https://github.com/shiqiwu212/GSB-S544-01/tree/9da9080d611abb96c9fb0e94998b4272037ee2df/Week%204/Lab)
+
+# 0. Setup & Utilities
+
+```{python}
+# AI assistance (Setup): An AI assistant provided structural guidance (web scraping,
+# API integration, automation, fuzzy matching, and analysis) and suggested robust helpers (HTTP retry,
+# day normalization) Plus environment-based secret handling. 
+
+import os, re, time
+import requests
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+import pandas as pd
+import matplotlib.pyplot as plt
+
+try:
+    from rapidfuzz import fuzz  # best accuracy
+except Exception:
+    from difflib import SequenceMatcher
+    class fuzz:  # lightweight fallback with a compatible API (partial_ratio)
+        @staticmethod
+        def partial_ratio(a, b):
+            a = (a or "").lower()
+            b = (b or "").lower()
+            if not a or not b:
+                return 0
+            if len(a) < len(b):
+                short, long = a, b
+            else:
+                short, long = b, a
+            best = 0.0
+            Ls, Ll = len(short), len(long)
+            for i in range(0, Ll - Ls + 1):
+                score = SequenceMatcher(None, short, long[i:i+Ls]).ratio()
+                if score > best:
+                    best = score
+            return int(best * 100)
+
+BASE = "https://tastesbetterfromscratch.com"
+CATEGORY = "/category/meal-plan/"
+USER_AGENT = "Mozilla/5.0 (compatible; Lab4-DataIsDelicious/1.0)"
+
+RAPID_API_KEY = os.getenv("RAPIDAPI_KEY", "")
+RAPID_HOST = "tasty.p.rapidapi.com"
+TASTY_SEARCH = f"https://{RAPID_HOST}/recipes/list"
+
+HEADERS_WEB = {"User-Agent": USER_AGENT}
+HEADERS_API = {
+    "X-RapidAPI-Key": RAPID_API_KEY,
+    "X-RapidAPI-Host": RAPID_HOST,
+    "User-Agent": USER_AGENT
+}
+
+DAY_NAMES = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+def norm_day(s: str) -> str:
+    s = (s or "").strip().lower()
+    for d in DAY_NAMES:
+        if d in s:
+            return d.title()
+    return ""
+
+def http_get(url, headers=None, params=None, retries=3, timeout=20):
+    for i in range(retries):
+        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if r.status_code == 200:
+            return r
+        time.sleep(1.2 * (i+1))
+    r.raise_for_status()
+```
+
+# 1. Data from unstructured websites
+
+```{python}
+# AI assistance (Web-scrape): An AI assistant proposed a resilient strategy to discover "Meal Plan Week N"
+# across paginated category pages and a sibling-based parsing approach for day → recipe mapping. Selectors
+# and validations were adapted and confirmed by the student.
+
+# ---- helpers that DO NOT raise on 404 / transient failures ----
+def _get_allow_404(url, headers=None, timeout=20):
+    try:
+        r = requests.get(url, headers=headers or HEADERS_WEB, timeout=timeout)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r
+    except requests.RequestException:
+        return None  # treat as not available
+
+def find_week_link_safe(week: int, max_probe: int = 50) -> str:
+    """
+    Try the meal-plan category first; if unreachable, fall back to common per-week slugs.
+    Pagination probes stop at the first 404 to avoid hitting non-existent pages.
+    """
+    def scan_for_week(html: str) -> str:
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.select("a[href]"):
+            txt = re.sub(r"\s+", " ", (a.get_text() or "")).strip().lower()
+            if (str(week) in txt) and ("week" in txt) and ("meal" in txt):
+                return urljoin(BASE, a["href"])
+        return ""
+
+    cat_index = urljoin(BASE, CATEGORY)
+
+    # 1) Try category index gracefully
+    r = _get_allow_404(cat_index, headers=HEADERS_WEB)
+    if r is not None:
+        link = scan_for_week(r.text)
+        if link:
+            return link
+
+        # 2) Probe subsequent pages; stop on first 404
+        for p in range(2, max_probe + 1):
+            page_url = urljoin(cat_index, f"./page/{p}/")
+            r2 = _get_allow_404(page_url, headers=HEADERS_WEB)
+            if r2 is None:  # 404 or transient → stop probing
+                break
+            link = scan_for_week(r2.text)
+            if link:
+                return link
+    else:
+        # Do not raise; go to slug fallbacks directly
+        print(f"Warning: category index not reachable: {cat_index}; trying slug candidates...")
+
+    # 3) Fallback: try common per-week slugs directly
+    for url in [
+        f"{BASE}/meal-plan-week-{week}/",
+        f"{BASE}/weekly-meal-plan-{week}/",
+        f"{BASE}/meal-plan-{week}/",
+    ]:
+        r3 = _get_allow_404(url, headers=HEADERS_WEB)
+        if r3 is not None:
+            return url
+
+    # 4) Optional environment override (keeps code free of hard-coded URLs)
+    override = os.getenv("MEALPLAN_WEEK_URL_OVERRIDE", "").strip()
+    if override:
+        print(f"Using MEALPLAN_WEEK_URL_OVERRIDE: {override}")
+        return override
+
+    raise RuntimeError(
+        f"Meal Plan Week {week} not found (category unreachable or no match; slug fallbacks failed)."
+    )
+
+def parse_week_page(week_url: str) -> pd.DataFrame:
+    html = http_get(week_url, headers=HEADERS_WEB).text
+    soup = BeautifulSoup(html, "lxml")
+    rows = []
+
+    # collect candidate tags that often hold weekday headings
+    candidates = []
+    for tag_name in ["h2","h3","h4","strong","p","li"]:
+        candidates.extend(soup.find_all(tag_name))
+
+    for tag in candidates:
+        day = norm_day(tag.get_text())
+        if not day:
+            continue
+
+        # find the first nearby <a> as the recipe link (scan a few siblings)
+        recipe_a = None
+        cursor = tag
+        for _ in range(12):
+            cursor = cursor.find_next_sibling()
+            if cursor is None:
+                break
+            link = cursor.find("a", href=True)
+            if link:
+                recipe_a = link
+                break
+        if not recipe_a:
+            link = tag.find("a", href=True)
+            if link:
+                recipe_a = link
+        if not recipe_a:
+            continue
+
+        name = re.sub(r"\s+", " ", recipe_a.get_text(strip=True))
+        href = urljoin(BASE, recipe_a["href"])
+
+        # try to detect a nearby price like "$12", "Under $15"
+        search_zone = " ".join([
+            tag.get_text(" ", strip=True),
+            recipe_a.get_text(" ", strip=True),
+            (recipe_a.parent.get_text(" ", strip=True) if recipe_a.parent else "")
+        ])
+        price = None
+        m = re.search(r"\$\s*\d+(?:\.\d{1,2})?", search_zone, flags=re.I)
+        if not m and recipe_a.parent:
+            nxt = recipe_a.parent.find_next_sibling()
+            if nxt:
+                m = re.search(r"\$\s*\d+(?:\.\d{1,2})?", nxt.get_text(" ", strip=True), flags=re.I)
+        if m:
+            price = m.group(0).replace(" ", "")
+
+        rows.append({
+            "Day of the Week": day,
+            "Name of Recipe": name,
+            "Link to Recipe": href,
+            "Price of Recipe": price
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Day of the Week").drop_duplicates("Day of the Week", keep="first")
+        all_days = pd.DataFrame({"Day of the Week": [d.title() for d in DAY_NAMES]})
+        df = all_days.merge(df, on="Day of the Week", how="left")
+    return df
+
+# ---- Build the weekly table (Week 202 as required later) ----
+week_chosen = 202
+week_url = find_week_link_safe(week_chosen)
+weekly_df = parse_week_page(week_url)
+print("Week URL:", week_url)
+weekly_df
+```
+
+# 2. Data from an API
+
+```{python}
+# AI assistance (API): An AI assistant recommended environment-based secret management, capped page-size
+# (≤100), and defensive guards so variables remain defined even if preconditions fail. 
+
+import pandas as pd
+
+# --- Always define the variable to avoid NameError later ---
+monday_matches = pd.DataFrame()
+
+# --- Preconditions: Step 1 must have produced weekly_df with a Monday entry ---
+if "weekly_df" not in globals():
+    raise RuntimeError("weekly_df is not defined. Run Step 1 before Step 2.")
+
+if weekly_df.empty:
+    raise RuntimeError("weekly_df is empty. Verify Step 1 scraped the week successfully.")
+
+mon_list = weekly_df.loc[weekly_df["Day of the Week"]=="Monday","Name of Recipe"].dropna().head(1).tolist()
+if not mon_list:
+    print("Warning: Monday recipe not found on the selected week page; returning empty monday_matches.")
+else:
+    monday_query = mon_list[0]
+
+    # --- API key check ---
+    if not RAPID_API_KEY:
+        print("Warning: RAPIDAPI_KEY is not set (Runtime → Environment Variables…). Returning empty monday_matches.")
+    else:
+        # --- Helpers (clean_query / tasty_search / match_recipe) ---
+        def clean_query(name: str) -> str:
+            q = name or ""
+            q = re.sub(r"\(.*?\)|\[.*?\]|[^A-Za-z0-9\s]", " ", q)
+            q = re.sub(r"\s+", " ", q).strip()
+            parts = q.split()
+            return " ".join(parts[:6]) if len(parts) > 6 else q
+
+        def tasty_search(query: str, max_results: int = 100) -> pd.DataFrame:
+            size = max(1, min(int(max_results), 100))
+            params = {"q": query, "from": 0, "size": size}
+            r = http_get(TASTY_SEARCH, headers=HEADERS_API, params=params)
+            payload = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+            items = payload.get("results", []) if isinstance(payload, dict) else []
+            out = []
+            for it in items:
+                nutrition = it.get("nutrition") or {}
+                out.append({
+                    "tasty_id": it.get("id"),
+                    "tasty_name": it.get("name"),
+                    "tasty_description": it.get("description"),
+                    "tasty_yields": it.get("yields"),
+                    "tasty_servings_noun": it.get("servings_noun"),
+                    "calories": nutrition.get("calories"),
+                    "carbohydrates": nutrition.get("carbohydrates"),
+                    "fat": nutrition.get("fat"),
+                    "fiber": nutrition.get("fiber"),
+                    "protein": nutrition.get("protein"),
+                    "sugar": nutrition.get("sugar"),
+                })
+            return pd.DataFrame(out)
+
+        def match_recipe(name: str, max_results: int = 100) -> pd.DataFrame:
+            q = clean_query(name)
+            if not q:
+                return pd.DataFrame()
+            df_local = tasty_search(q, max_results=max_results)
+            df_local.insert(0, "query", q)
+            return df_local
+
+        # --- Do the Monday search; ensures monday_matches is set even if API returns nothing ---
+        try:
+            monday_matches = match_recipe(monday_query, max_results=100)
+        except Exception as e:
+            print(f"Warning: Tasty API call failed ({e}); returning empty monday_matches.")
+            monday_matches = pd.DataFrame()
+
+monday_matches
+```
+
+# 3. Automate it
+
+```{python}
+# AI assistance (Automation): An AI assistant proposed a modular pipeline—(1) discover the Week link,
+# (2) parse the HTML plan, (3) call the API, (4) build a tidy table—so functions remain composable and
+# free of week-specific hard-coding. The assistant also suggested resilient pagination: probe category
+# pages in order and *gracefully stop* on 404 instead of raising. Clear error messages and small, testable
+
+TASTY_SEARCH = "https://tasty.p.rapidapi.com/recipes/list"
+TASTY_INFO   = "https://tasty.p.rapidapi.com/recipes/get-more-info"
+
+# ---------- small string helpers (NaN-safe) ----------
+def _to_text(x) -> str:
+    if isinstance(x, str):
+        return x
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x or "")
+
+def clean_query(name: str) -> str:
+    q = _to_text(name)
+    q = re.sub(r"\(.*?\)|\[.*?\]|[^A-Za-z0-9\s]", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    parts = q.split()
+    return " ".join(parts[:6]) if len(parts) > 6 else q
+
+# ---------- Tasty API: search (no-key safe) ----------
+def tasty_search(query: str, max_results: int = 50) -> pd.DataFrame:
+    cols = ["tasty_id","tasty_name","tasty_description","tasty_yields","tasty_servings_noun",
+            "calories","carbohydrates","fat","fiber","protein","sugar"]
+    if not RAPID_API_KEY:
+        print("Warning: RAPIDAPI_KEY not set; returning empty results for Tasty API search.")
+        return pd.DataFrame(columns=cols)
+
+    size = max(1, min(int(max_results), 100))
+    params = {"q": query, "from": 0, "size": size}
+    r = http_get(TASTY_SEARCH, headers=HEADERS_API, params=params)
+    payload = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+    items = payload.get("results", []) if isinstance(payload, dict) else []
+    out = []
+    for it in items:
+        nutrition = it.get("nutrition") or {}
+        out.append({
+            "tasty_id": it.get("id"),
+            "tasty_name": it.get("name"),
+            "tasty_description": it.get("description"),
+            "tasty_yields": it.get("yields"),
+            "tasty_servings_noun": it.get("servings_noun"),
+            "calories": nutrition.get("calories"),
+            "carbohydrates": nutrition.get("carbohydrates"),
+            "fat": nutrition.get("fat"),
+            "fiber": nutrition.get("fiber"),
+            "protein": nutrition.get("protein"),
+            "sugar": nutrition.get("sugar"),
+        })
+    return pd.DataFrame(out)
+
+# ---------- fuzzy pick one best match per day ----------
+def pick_best_match(name: str, df_matches: pd.DataFrame):
+    s = clean_query(name)
+    if not s or df_matches.empty:
+        return None
+    try:
+        from rapidfuzz import fuzz
+        scores = df_matches["tasty_name"].fillna("").map(lambda x: fuzz.WRatio(s, str(x)))
+    except Exception:
+        import difflib
+        scores = df_matches["tasty_name"].fillna("").map(
+            lambda x: int(100 * difflib.SequenceMatcher(None, s.lower(), str(x).lower()).ratio())
+        )
+    idx = scores.astype(float).idxmax()
+    if pd.isna(idx):
+        return None
+    row = df_matches.loc[idx]
+    return {"tasty_id": row.get("tasty_id"), "tasty_name": row.get("tasty_name")}
+
+# ---------- enrich missing nutrition via get-more-info ----------
+def tasty_more_info(tasty_id) -> dict:
+    try:
+        if tasty_id in (None, ""):
+            return {}
+        r = http_get(TASTY_INFO, headers=HEADERS_API, params={"id": int(tasty_id)})
+        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+        nutr = data.get("nutrition") or {}
+        return {
+            "calories": nutr.get("calories"),
+            "carbohydrates": nutr.get("carbohydrates"),
+            "fat": nutr.get("fat"),
+            "fiber": nutr.get("fiber"),
+            "protein": nutr.get("protein"),
+            "sugar": nutr.get("sugar"),
+        }
+    except Exception:
+        return {}
+
+# ---------- assemble ----------
+def get_weekly_plan(week: int) -> pd.DataFrame:
+    # requires Step 1: find_week_link_safe + parse_week_page
+    return parse_week_page(find_week_link_safe(week))
+
+def get_mealplan_data(week: int) -> pd.DataFrame:
+    base = get_weekly_plan(week)
+    rows = []
+    for _, row in base.iterrows():
+        day   = row["Day of the Week"]
+        name  = _to_text(row["Name of Recipe"]).strip()
+        link  = row["Link to Recipe"]
+        price = row["Price of Recipe"]
+
+        if not name:
+            rows.append({"week": week, "day": day, "recipe_name": name, "recipe_url": link, "recipe_price": price,
+                         "tasty_id": None, "tasty_name": None,
+                         "calories": None, "carbohydrates": None, "fat": None, "fiber": None, "protein": None, "sugar": None})
+            continue
+
+        matches = tasty_search(name, max_results=50)
+        best = pick_best_match(name, matches)
+        if not best:
+            rows.append({"week": week, "day": day, "recipe_name": name, "recipe_url": link, "recipe_price": price,
+                         "tasty_id": None, "tasty_name": None,
+                         "calories": None, "carbohydrates": None, "fat": None, "fiber": None, "protein": None, "sugar": None})
+            continue
+
+        info = tasty_more_info(best["tasty_id"])
+        rows.append({
+            "week": week, "day": day, "recipe_name": name, "recipe_url": link, "recipe_price": price,
+            "tasty_id": best["tasty_id"], "tasty_name": best["tasty_name"],
+            "calories": info.get("calories"), "carbohydrates": info.get("carbohydrates"),
+            "fat": info.get("fat"), "fiber": info.get("fiber"),
+            "protein": info.get("protein"), "sugar": info.get("sugar")
+        })
+    out = pd.DataFrame(rows)
+    # keep numeric types for plotting
+    for col in ["calories","carbohydrates","fat","fiber","protein","sugar"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+# ---- run Week 202 ----
+df = get_mealplan_data(202)
+print("df rows (week 202):", len(df))
+try:
+    print(df[["day","recipe_name","calories","protein","sugar"]].head(10))
+except Exception:
+    pass
+```
+
+# 4. Add a column with fuzzy matching
+
+```{python}
+# AI assistance (Fuzzy matching): An AI assistant suggested a maintainable meat-word list and a fuzzy strategy
+# to reduce false negatives for typos. 
+
+MEAT_WORDS = [
+    "chicken","beef","steak","pork","bacon","turkey","sausage","ham","lamb",
+    "salmon","tuna","shrimp","fish","meatball","chorizo","prosciutto","pepperoni",
+]
+
+def is_vegetarian(name: str, threshold: int = 88) -> bool:
+    s = (name or "").lower()
+    for w in MEAT_WORDS:
+        if w in s:
+            return False
+        if fuzz.partial_ratio(s, w) >= threshold:
+            return False
+    return True
+
+df["is_vegetarian"] = df["recipe_name"].apply(is_vegetarian)
+df.head(10)
+```
+
+# 6. Analyze
+
+```{python}
+# AI assistance (Analysis): Suggested median-by-day visualization with weekday categorical order and vegetarian markers.
+# Also proposed a parameterized METRIC selector with numeric labels; figure renders self-contained in HTML.
+
+# Cleaned data if present
+df_source = df_clean if "df_clean" in globals() else df
+
+# ensure vegetarian flag exists
+if "is_vegetarian" not in df_source.columns:
+    df_source = df_source.assign(is_vegetarian=False)
+
+# focus on week 202
+d202 = df_source[df_source["week"] == 202].copy()
+
+# coerce numeric metrics
+for c in ["calories","protein","sugar"]:
+    if c in d202.columns:
+        d202[c] = pd.to_numeric(d202[c], errors="coerce")
+
+# try metrics in order; pick the first with any non-null
+candidates = [("calories","Calories"), ("protein","Protein"), ("sugar","Sugar")]
+chosen = None
+for col, label in candidates:
+    if col in d202.columns and d202[col].notna().any():
+        chosen = (col, label)
+        break
+
+day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+if chosen is not None:
+    METRIC, METRIC_LABEL = chosen
+    plot_data = (
+        d202.dropna(subset=["day", METRIC])
+            .groupby("day", as_index=False)
+            .agg(median_value=(METRIC, "median"),
+                 any_veg=("is_vegetarian", "max"))
+    )
+    plot_data["day"] = pd.Categorical(plot_data["day"], categories=day_order, ordered=True)
+    plot_data = plot_data.sort_values("day")
+
+    plt.figure(figsize=(9,4.8))
+    plt.bar(plot_data["day"].astype(str), plot_data["median_value"])
+    for i, r in plot_data.reset_index(drop=True).iterrows():
+        v = r["median_value"]
+        if pd.notna(v):
+            plt.text(i, v * 1.01, f"{v:.0f}", ha="center", va="bottom", fontsize=9)
+        if r["any_veg"]:
+            plt.text(i, (v if pd.notna(v) else 0) * 1.10 + (0 if pd.notna(v) else 0.1),
+                     "VEG", ha="center", va="bottom", fontsize=9)
+
+    plt.title(f"Mealplan 202 — Median {METRIC_LABEL} by Day (Tasty matches)")
+    plt.xlabel("Day of Week"); plt.ylabel(f"Median {METRIC_LABEL}")
+    plt.tight_layout(); plt.show()
+
+else:
+    # final fallback: recipe counts per day (ensures a chart even without nutrition)
+    counts = (
+        d202.dropna(subset=["day"])
+            .groupby("day", as_index=False)
+            .size()
+            .rename(columns={"size":"recipes"})
+    )
+    counts["day"] = pd.Categorical(counts["day"], categories=day_order, ordered=True)
+    counts = counts.sort_values("day")
+
+    plt.figure(figsize=(9,4.8))
+    plt.bar(counts["day"].astype(str), counts["recipes"])
+    for i, r in counts.reset_index(drop=True).iterrows():
+        plt.text(i, r["recipes"] * 1.03, f"{int(r['recipes'])}", ha="center", va="bottom", fontsize=9)
+
+    plt.title("Mealplan 202 — Recipes per Day (nutrition unavailable)")
+    plt.xlabel("Day of Week"); plt.ylabel("Number of Recipes")
+    plt.tight_layout(); plt.show()
+```
